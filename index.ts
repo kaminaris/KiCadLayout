@@ -12,7 +12,6 @@ export {
 	placeFromInputs,
 	emitFragment,
 	emitConnectivity,
-	emitCircuitFragment,
 	symbolFieldLayout,
 	wrapFullSchematic,
 	isEditablePowerPlacement,

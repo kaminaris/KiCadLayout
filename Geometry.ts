@@ -218,7 +218,7 @@ export function stubAwayFromBody(
 }
 
 /** True if segment is axis-aligned (horizontal or vertical). */
-export function isOrthogonalSegment(a: Point2, b: Point2, eps = 1e-6): boolean {
+function isOrthogonalSegment(a: Point2, b: Point2, eps = 1e-6): boolean {
 	return Math.abs(a.x - b.x) < eps || Math.abs(a.y - b.y) < eps;
 }
 
@@ -339,18 +339,6 @@ export function gndStubToCustomPos(
 		y2: gndPos.y
 	});
 	return { gndPos, junction, segments };
-}
-
-export function rotateLocalExtents(
-	hw: number,
-	hh: number,
-	rotation: number
-): { hw: number; hh: number } {
-	const r = normalizeRot(rotation);
-	if (r === 90 || r === 270) {
-		return { hw: hh, hh: hw };
-	}
-	return { hw, hh };
 }
 
 /**

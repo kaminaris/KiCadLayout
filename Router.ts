@@ -303,7 +303,7 @@ export function collectGndPowerPlacements(
 }
 
 /** All pin tips in world space with owning net (for foreign-pin keep-outs). */
-export function collectAllPinTips(input: AutorouteInput): Array<Point2 & { net: string; ref: string; pin: string }> {
+function collectAllPinTips(input: AutorouteInput): Array<Point2 & { net: string; ref: string; pin: string }> {
 	const out: Array<Point2 & { net: string; ref: string; pin: string }> = [];
 	for (const p of input.placements) {
 		if (isPowerGndLib(p.libId) || p.ref.startsWith('#')) {
@@ -660,8 +660,7 @@ function routeEdge(
 	gridMm: number,
 	netTips: Point2[],
 	exitFrom: Point2 = { x: 0, y: 0 },
-	exitTo: Point2 = { x: 0, y: 0 },
-	maxBends: number = Infinity
+	exitTo: Point2 = { x: 0, y: 0 }
 ): Point2[] | null {
 	const start = { x: from.x, y: from.y };
 	const end = { x: to.x, y: to.y };
@@ -811,9 +810,8 @@ function routeEdge(
 		}
 	}
 
-	const boundedCandidates = candidates.filter(path => Math.max(0, path.length - 2) <= maxBends);
-	if (boundedCandidates.length) {
-		boundedCandidates.sort((a, b) => {
+	if (candidates.length) {
+		candidates.sort((a, b) => {
 			// Never leave (or enter) a pin backward through its body, even at the
 			// cost of an extra bend — a clean U out the front beats a jog through it.
 			const aBack = (startsBackward(a) ? 1 : 0) + (endsBackward(a) ? 1 : 0);
@@ -833,13 +831,7 @@ function routeEdge(
 			}
 			return pathLength(a) - pathLength(b);
 		});
-		return boundedCandidates[0]!;
-	}
-
-	// Local rewires deliberately do not fall back to a maze when the caller
-	// asks for a bounded bend count.
-	if (Number.isFinite(maxBends)) {
-		return null;
+		return candidates[0]!;
 	}
 
 	// --- Lee / maze A* on fine grid (biased toward straight exits) ---
@@ -1248,7 +1240,7 @@ function parseKey(k: string): Point2 {
 /** KiCad per-wire stroke color for forced/invalid connections (red, opaque). */
 const INVALID_WIRE_COLOR = '(color 255 0 0 1)';
 
-export function emitWireSexpr(seg: WireSegment): string {
+function emitWireSexpr(seg: WireSegment): string {
 	const stroke = seg.invalid
 		? `(stroke (width 0) (type default) ${ INVALID_WIRE_COLOR })`
 		: '(stroke (width 0) (type default))';

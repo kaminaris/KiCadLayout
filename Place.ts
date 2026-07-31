@@ -272,36 +272,6 @@ export function placeFromInputs(body: SeedInputs): CircuitDesignPlaceResult {
 	};
 }
 
-export function emitCircuitFragment(opts: {
-	libNeeded: Map<string, string>;
-	placements: CircuitPlacement[];
-	icPins: import('./Geometry').PinLocal[];
-	footprintByRef: Record<string, string>;
-	mpnByRef: Record<string, string>;
-	datasheet: string;
-	warnings: string[];
-	mode?: ConnectivityMode;
-	wires?: import('./Router').WireSegment[];
-	unroutedNets?: string[];
-	floatingNets?: string[];
-	stubNets?: string[];
-}): string {
-	return emitFragment({
-		libNeeded: opts.libNeeded,
-		placements: opts.placements,
-		icPins: opts.icPins,
-		footprintByRef: opts.footprintByRef,
-		mpnByRef: opts.mpnByRef,
-		datasheet: opts.datasheet,
-		warnings: opts.warnings,
-		mode: opts.mode ?? 'labels',
-		wires: opts.wires ?? [],
-		unroutedNets: opts.unroutedNets ?? [],
-		floatingNets: opts.floatingNets ?? [],
-		stubNets: opts.stubNets ?? []
-	});
-}
-
 export function emitFragment(opts: {
 	libNeeded: Map<string, string>;
 	placements: CircuitPlacement[];

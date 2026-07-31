@@ -150,7 +150,7 @@ function insertBeforeRootClose(stripped: string, block: string): string {
 }
 
 /** Index of the `)` that closes the root `(kicad_sch …)` form. */
-export function findRootKicadSchClose(text: string): number {
+function findRootKicadSchClose(text: string): number {
 	const open = text.indexOf('(kicad_sch');
 	if (open < 0) {
 		return -1;
