@@ -87,8 +87,8 @@ export function scoreLayout(input: ScoreInput): LayoutScore {
 		p => p.libId !== 'power:GND' && !p.ref.startsWith('#')
 	);
 	const bodies = [
-		...buildBodyObstacles(componentPlacements, input.icPins),
-		...buildBodyObstacles(gndPlacements, [])
+		...buildBodyObstacles(componentPlacements, pinsForLib),
+		...buildBodyObstacles(gndPlacements, () => [])
 	];
 	// Map body index → owner ref for skipping owner↔own-GND overlap.
 	const bodyOwnerRef = [

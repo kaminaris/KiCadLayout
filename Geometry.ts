@@ -12,10 +12,12 @@ export const SCH_GRID_MM = 0.254;
  */
 export const FINE_GRID_MM = 1.27;
 /**
- * Collision / routing clearance: 2 symbol-grid units beyond graphic extent
- * on every side. Device:R graphic ≈ 2×6 grid → padded box 6×10.
+ * Collision / routing clearance: 1 symbol-grid unit beyond graphic extent on
+ * every side. Two facing components each pad by this, so they need 2 clear grid
+ * units between their graphics to route between them (a 2-grid pad would demand
+ * 4, which reads as too much dead space).
  */
-export const BODY_PAD_MM = 2 * FINE_GRID_MM;
+export const BODY_PAD_MM = FINE_GRID_MM;
 
 export interface Point2 {
 	x: number;
@@ -138,11 +140,16 @@ export function localToWorld(
  * World-space pin orientation (toward body) in KiCad angle convention
  * (0=+X, 90=up/−Y, 180=−X, 270=down/+Y).
  *
- * Library pin angles already use that compass; Y-flip of the position does
- * not change the compass angle (north stays north on the sheet).
+ * The position transform ({@link localToWorld}) rotates a Y-flipped point by
+ * `(x,y)→(-y,x)` for +90°, which maps a compass direction φ → φ − rotation.
+ * The pin's library angle already equals its Y-flipped compass "toward body"
+ * (the schematic compass here bakes in the Y-flip), so the world orientation is
+ * `pinLibRotation − symbolRotation`. Using `+` (the old bug) put the outward
+ * exit 180° wrong for 90°/270° rotations, so wires left rotated passives INTO
+ * the body instead of away from it.
  */
 export function libPinWorldRotation(pinLibRotation: number, symbolRotation: number): number {
-	return normalizeRot(pinLibRotation + symbolRotation);
+	return normalizeRot(pinLibRotation - symbolRotation);
 }
 
 /**

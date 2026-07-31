@@ -11,7 +11,9 @@ export {
 	seedFromInputs,
 	placeFromInputs,
 	emitFragment,
+	emitConnectivity,
 	emitCircuitFragment,
+	symbolFieldLayout,
 	wrapFullSchematic,
 	isEditablePowerPlacement,
 	componentPlacementsOnly,
@@ -27,6 +29,29 @@ export type {
 	CircuitDesignSeedResult,
 	CircuitDesignPlaceResult,
 	ConnectivityMode,
+	SymbolFieldLayout,
 } from './Place';
 export { reroute } from './Reroute';
 export type { RerouteInput, RerouteResult } from './Reroute';
+export {
+	lockNetlistFromSchematic,
+	pinsForLockedLib,
+} from './LockNetlist';
+export type { LockedNetlist } from './LockNetlist';
+export { applyLockedPinNets, rewireSchematic } from './Rewire';
+export type { RewireInput, RewireResult } from './Rewire';
+export {
+	replaceSchematicWires,
+	replaceConnectivityGraphics,
+	stripSchematicWiresAndJunctions,
+	stripConnectivityGraphics,
+} from './SchematicWirePatch';
+export {
+	SchematicConnectivityService,
+	SchematicConnectivityError,
+} from './Connectivity';
+export type {
+	SchematicConnectivitySummary,
+	ConnectivityComponent,
+	ConnectivityNet,
+} from './Connectivity';

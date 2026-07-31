@@ -40,7 +40,13 @@ import {
 	stubAwayFromBody
 } from './Geometry';
 import type { WireSegment } from './Router';
-import { collectGndPowerPlacements, emitWiresSexpr } from './Router';
+import {
+	collectGndPowerPlacements,
+	computeJunctions,
+	emitJunctionsSexpr,
+	emitWiresSexpr,
+	mergeCollinearSegments
+} from './Router';
 
 const GRID = DEFAULT_GRID_MM;
 /** Stub from pin tip to label / power-symbol attach (mm) — clear pin names + GND glyph. */
@@ -312,32 +318,21 @@ export function emitFragment(opts: {
 }): string {
 	const mode = opts.mode ?? 'labels';
 	const wires = opts.wires ?? [];
+	const stub = new Set(opts.stubNets ?? []);
 	const unrouted = new Set(opts.unroutedNets ?? []);
 	const floating = new Set(opts.floatingNets ?? []);
-	const stub = new Set(opts.stubNets ?? []);
-	const labelNets = new Set([...unrouted, ...floating, ...stub]);
 	const libs = [...opts.libNeeded.values()].join('\n');
 	const parts: string[] = [];
 	parts.push(`(lib_symbols\n${ libs }\n)`);
 
 	const components = componentPlacementsOnly(opts.placements);
-	const gndOverrideByRef = new Map(
-		opts.placements
-			.filter(isEditablePowerPlacement)
-			.map(p => [p.ref, p] as const)
-	);
 
-	let pwrIndex = 1;
-	const seenPowerLabels = new Set<string>();
-	const stubWires: WireSegment[] = [];
-	/** Labels mode always stubs every pin tip; wire modes stub only fallback/floating. */
-	const attachStubs = mode === 'labels' || mode === 'wires-with-label-fallback';
-
+	// Symbol instances — the recipe path owns these. The locked "rewire" path
+	// keeps the opened file's symbols and only regenerates connectivity graphics
+	// (see emitConnectivity, shared by both paths).
 	for (const p of components) {
-		const uuid = randomUUID();
 		const fp = opts.footprintByRef[p.ref] ?? '';
 		const mpn = opts.mpnByRef[p.ref] ?? '';
-		const pins = pinsForLib(p.libId, opts.icPins);
 		parts.push(emitSymbolInstance({
 			libId: p.libId,
 			ref: p.ref,
@@ -345,14 +340,106 @@ export function emitFragment(opts: {
 			x: p.x,
 			y: p.y,
 			rotation: p.rotation,
-			uuid,
+			uuid: randomUUID(),
 			footprint: fp,
 			datasheet: p.role === 'IC' ? opts.datasheet : '~',
 			mpn,
 			pins: p.role === 'IC' ? opts.icPins : undefined
 		}));
+	}
 
-		if (attachStubs) {
+	if (isCircuitDesignDebug()) {
+		logEmitPinDebug(components, opts.icPins);
+	}
+
+	const conn = emitConnectivity({
+		components,
+		pinsForLib: (libId) => pinsForLib(libId, opts.icPins),
+		mode,
+		wires,
+		unroutedNets: opts.unroutedNets,
+		floatingNets: opts.floatingNets,
+		stubNets: opts.stubNets,
+		gndOverrides: opts.placements.filter(isEditablePowerPlacement)
+	});
+	if (conn.block) {
+		parts.push(conn.block);
+	}
+
+	if (mode === 'labels') {
+		opts.warnings.push(
+			'Connectivity: short stub wires from each pin tip to net labels / GND power symbols. '
+			+ 'Paste into an open KiCad schematic (Ctrl+V), then rearrange as needed.'
+		);
+	}
+	else {
+		opts.warnings.push(
+			`Connectivity: Manhattan wires (${ wires.length } segments)`
+			+ (conn.stubCount ? ` + ${ conn.stubCount } pin stubs` : '')
+			+ (stub.size
+				? `; power stubs for ${ [...stub].join(', ') }`
+				: '')
+			+ (unrouted.size
+				? `; label fallback for ${ [...unrouted].join(', ') }`
+				: '')
+			+ (floating.size
+				? `; floating labels for ${ [...floating].join(', ') }`
+				: '')
+			+ '. Paste into KiCad with Ctrl+V.'
+		);
+	}
+
+	return parts.join('\n\n') + '\n';
+}
+
+/**
+ * Emit the connectivity graphics block for a set of component placements:
+ * pin stubs, per-pin GND power symbols, net labels, route wires, and junctions.
+ * Shared by the recipe path ({@link emitFragment}) and the locked rewire path
+ * ({@link rewireSchematic}) — the single place all wire/label/GND/junction
+ * drawing lives, so there is no duplicated re-drawing logic.
+ *
+ * Does NOT emit `lib_symbols` or component symbol instances — callers own those
+ * (recipe emits them fresh; rewire keeps the opened file's).
+ */
+export function emitConnectivity(opts: {
+	components: CircuitPlacement[];
+	pinsForLib: (libId: string) => PinLocal[];
+	mode: ConnectivityMode;
+	wires: WireSegment[];
+	unroutedNets?: string[];
+	floatingNets?: string[];
+	stubNets?: string[];
+	/** User-moved #PWR poses (recipe editable GND). Omit for full regenerate. */
+	gndOverrides?: CircuitPlacement[];
+	/** Ground nets (power:GND symbol present). Authoritative over the name check. */
+	gndNets?: Set<string>;
+	/** Ground net → ground glyph lib id, so regenerated grounds keep their glyph. */
+	gndLibByNet?: Record<string, string>;
+}): { block: string; stubCount: number; junctionCount: number } {
+	const mode = opts.mode;
+	const isGnd = (net: string): boolean =>
+		opts.gndNets ? opts.gndNets.has(net) : isGndNet(net);
+	const wires = opts.wires ?? [];
+	const labelNets = new Set([
+		...(opts.unroutedNets ?? []),
+		...(opts.floatingNets ?? []),
+		...(opts.stubNets ?? [])
+	]);
+	/** Labels mode stubs every pin tip; wire modes stub only fallback/floating. */
+	const attachStubs = mode === 'labels' || mode === 'wires-with-label-fallback';
+	const gndOverrideByRef = new Map(
+		(opts.gndOverrides ?? []).map(p => [p.ref, p] as const)
+	);
+
+	const parts: string[] = [];
+	const stubWires: WireSegment[] = [];
+	let pwrIndex = 1;
+	const seenPowerLabels = new Set<string>();
+
+	if (attachStubs) {
+		for (const p of opts.components) {
+			const pins = opts.pinsForLib(p.libId);
 			for (const pin of pins) {
 				const net = p.pinNets[pin.number];
 				if (!net) {
@@ -365,7 +452,7 @@ export function emitFragment(opts: {
 				const tip = localToWorld(p.x, p.y, p.rotation, pin.x, pin.y);
 				const towardBody = libPinWorldRotation(pin.rotation, p.rotation);
 
-				if (isGndNet(net)) {
+				if (isGnd(net)) {
 					// First segment from power:GND must leave straight up (−Y).
 					const gndRef = `#PWR${ String(pwrIndex++).padStart(2, '0') }`;
 					const override = gndOverrideByRef.get(gndRef);
@@ -373,22 +460,18 @@ export function emitFragment(opts: {
 						? gndStubToCustomPos(tip, { x: override.x, y: override.y }, STUB_LEN_MM)
 						: gndStubFromPin({ x: p.x, y: p.y }, tip, STUB_LEN_MM, towardBody);
 					for (const s of geom.segments) {
-						stubWires.push({
-							net,
-							x1: s.x1,
-							y1: s.y1,
-							x2: s.x2,
-							y2: s.y2
-						});
+						stubWires.push({ net, x1: s.x1, y1: s.y1, x2: s.x2, y2: s.y2 });
 					}
-					const gndUuid = randomUUID();
-					const gndRot = gndInstanceRotation();
 					parts.push(emitPowerGndInstance({
 						ref: gndRef,
 						x: geom.gndPos.x,
 						y: geom.gndPos.y,
-						rotation: gndRot,
-						uuid: gndUuid
+						rotation: gndInstanceRotation(),
+						uuid: randomUUID(),
+						// Keep the net's own glyph + name so distinct grounds
+						// (GND / GNDA / a renamed ground) never merge.
+						libId: opts.gndLibByNet?.[net] ?? 'power:GND',
+						value: net
 					}));
 					continue;
 				}
@@ -399,15 +482,8 @@ export function emitFragment(opts: {
 					STUB_LEN_MM,
 					towardBody
 				);
-
 				// Stub from electrical pin tip → label / power symbol attach point.
-				stubWires.push({
-					net,
-					x1: tip.x,
-					y1: tip.y,
-					x2: stubEnd.x,
-					y2: stubEnd.y
-				});
+				stubWires.push({ net, x1: tip.x, y1: tip.y, x2: stubEnd.x, y2: stubEnd.y });
 
 				if (isPowerLikeNet(net)) {
 					const key = `${ net }@${ fmtMm(stubEnd.x) },${ fmtMm(stubEnd.y) }`;
@@ -433,39 +509,22 @@ export function emitFragment(opts: {
 		}
 	}
 
-	if (isCircuitDesignDebug()) {
-		logEmitPinDebug(components, opts.icPins);
-	}
-
-	const allWires = [...stubWires, ...wires];
+	// Merge collinear overlaps so a branch tapping the trunk reads as a junction,
+	// not a doubled wire.
+	const allWires = mergeCollinearSegments([...stubWires, ...wires]);
 	if (allWires.length) {
 		parts.push(emitWiresSexpr(allWires));
 	}
-
-	if (mode === 'labels') {
-		opts.warnings.push(
-			'Connectivity: short stub wires from each pin tip to net labels / GND power symbols. '
-			+ 'Paste into an open KiCad schematic (Ctrl+V), then rearrange as needed.'
-		);
-	}
-	else {
-		opts.warnings.push(
-			`Connectivity: Manhattan wires (${ wires.length } segments)`
-			+ (stubWires.length ? ` + ${ stubWires.length } pin stubs` : '')
-			+ (stub.size
-				? `; power stubs for ${ [...stub].join(', ') }`
-				: '')
-			+ (unrouted.size
-				? `; label fallback for ${ [...unrouted].join(', ') }`
-				: '')
-			+ (floating.size
-				? `; floating labels for ${ [...floating].join(', ') }`
-				: '')
-			+ '. Paste into KiCad with Ctrl+V.'
-		);
+	const junctions = computeJunctions(allWires);
+	if (junctions.length) {
+		parts.push(emitJunctionsSexpr(junctions));
 	}
 
-	return parts.join('\n\n') + '\n';
+	return {
+		block: parts.join('\n\n'),
+		stubCount: stubWires.length,
+		junctionCount: junctions.length
+	};
 }
 
 export function wrapFullSchematic(fragment: string): string {
@@ -546,20 +605,24 @@ function emitSymbolInstance(opts: {
  * draws text upright — storing 0° on a 90° symbol flips draw angle to vertical
  * and parks labels on the body.
  */
-function symbolFieldLayout(
-	libId: string,
-	x: number,
-	y: number,
-	rotation: number,
-	pins?: PinLocal[]
-): {
+export interface SymbolFieldLayout {
 	refX: number;
 	refY: number;
 	valX: number;
 	valY: number;
 	fieldRot: number;
 	justify: 'left' | 'middle';
-} {
+}
+
+/** Auto-placed Reference/Value anchors for a symbol at a given pose — used by
+ *  the emit path and by the editor's "tidy fields" action. */
+export function symbolFieldLayout(
+	libId: string,
+	x: number,
+	y: number,
+	rotation: number,
+	pins?: PinLocal[]
+): SymbolFieldLayout {
 	const rot = normalizeRot(rotation);
 	const odd = rot === 90 || rot === 270;
 	// Store 90° when the symbol is on an odd quarter-turn so KiCad keep-upright
@@ -628,16 +691,22 @@ function emitPowerGndInstance(opts: {
 	y: number;
 	rotation: number;
 	uuid: string;
+	/** Ground glyph lib id (default power:GND). */
+	libId?: string;
+	/** Power net name — drives the net in KiCad (default GND). */
+	value?: string;
 }): string {
 	const rot = normalizeRot(opts.rotation);
+	const libId = opts.libId || 'power:GND';
+	const value = opts.value || 'GND';
 	return `
-(symbol (lib_id "power:GND") (at ${ fmtMm(opts.x) } ${ fmtMm(opts.y) } ${ rot }) (unit 1)
+(symbol (lib_id "${ escapeSexpr(libId) }") (at ${ fmtMm(opts.x) } ${ fmtMm(opts.y) } ${ rot }) (unit 1)
   (exclude_from_sim no) (in_bom yes) (on_board yes) (dnp no) (fields_autoplaced yes)
   (uuid "${ opts.uuid }")
   (property "Reference" "${ escapeSexpr(opts.ref) }" (at ${ fmtMm(opts.x) } ${ fmtMm(opts.y) } ${ rot })
     (effects (font (size 1.27 1.27)) (hide yes))
   )
-  (property "Value" "GND" (at ${ fmtMm(opts.x) } ${ fmtMm(opts.y) } ${ rot })
+  (property "Value" "${ escapeSexpr(value) }" (at ${ fmtMm(opts.x) } ${ fmtMm(opts.y) } ${ rot })
     (effects (font (size 1.27 1.27)) (hide yes))
   )
   (property "Footprint" "" (at ${ fmtMm(opts.x) } ${ fmtMm(opts.y) } ${ rot })
