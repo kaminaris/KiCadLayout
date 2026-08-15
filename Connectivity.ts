@@ -370,7 +370,14 @@ export class SchematicConnectivityService {
 			const origin = instance.getOrigin();
 			const mirror = readMirror(instance);
 			const placedUnit = instance.getUnitId() || 1;
-			const libDef = libSymbols?.findSymbolByName(libId) ?? null;
+			// (lib_name "X") overrides the lib_symbols lookup key when
+			// present — see SchematicPainter.buildSymbolInstance's identical
+			// fix for why. Without this, a symbol like this (real files:
+			// commonly power:GND placed multiple times, each getting its own
+			// "GND_1"/"GND_2" cached copy) resolves no pins at all here,
+			// silently dropping it from the connectivity graph entirely.
+			const libLookupName = instance.getLibName?.() ?? libId;
+			const libDef = libSymbols?.findSymbolByName(libLookupName) ?? null;
 			const pinSummaries: ConnectivityPinSummary[] = [];
 
 			if (libDef) {
