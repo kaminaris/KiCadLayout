@@ -381,7 +381,7 @@ export class SchematicConnectivityService {
 			const pinSummaries: ConnectivityPinSummary[] = [];
 
 			if (libDef) {
-				for (const sub of relevantSubUnits(libDef, placedUnit)) {
+				for (const sub of relevantSubUnits(libDef, placedUnit, libSymbols)) {
 					for (const pin of sub.findChildrenByClass(KicadElementPin)) {
 						// Invisible POWER pins (e.g. the pin inside a power:GND / +3.3V
 						// symbol) are still electrically connected in KiCad — skipping
@@ -884,29 +884,40 @@ function isPwrFlagSymbol(libId: string, value: string, rawRef: string): boolean 
 	return id === 'power:PWR_FLAG' || id.endsWith(':PWR_FLAG');
 }
 
+/** Was its own hand-rolled attribute/children scan — went stale when
+ *  KicadElementMirror got properly registered (KicadElementLiteral's
+ *  afterParse() consumes `(mirror y)`'s bareword attribute into `.value`
+ *  and clears `.attributes`, so this always returned null afterward,
+ *  silently dropping every mirrored symbol's pins out of the connectivity
+ *  graph — see [[kicad-viewer-mirror-rotation-order]] for the render-side
+ *  history of this exact class of bug). Delegates to
+ *  KicadElementSymbol.getMirror(), the one already kept correct for
+ *  rendering, instead of maintaining a second implementation. */
 function readMirror(instance: KicadElementSymbol): 'x' | 'y' | null {
-	const mirrorEl = instance.findFirstChildByName('mirror');
-	if (!mirrorEl) {
-		return null;
-	}
-	for (const attr of mirrorEl.attributes) {
-		const v = String(attr.value);
-		if (v === 'x' || v === 'y') {
-			return v;
-		}
-	}
-	for (const child of mirrorEl.children) {
-		if (child.name === 'x' || child.name === 'y') {
-			return child.name as 'x' | 'y';
-		}
-	}
-	return null;
+	return instance.getMirror();
 }
 
-function relevantSubUnits(libDef: KicadElementSymbol, placedUnit: number): KicadElementSymbol[] {
-	const subUnits = libDef.getLayers();
+/** A derived symbol (`(extends "Base")`, e.g. AMS1117-3.3 extending a
+ *  shared AMS1117 base) has no sub-unit children of its own — all pins live
+ *  only on the base. Without resolving that chain, the old
+ *  `subUnits.length === 0` fallback (`return [libDef]`) returned a symbol
+ *  with NO pins at all, so every one of its pads failed net matching (`no
+ *  pin N in symbol`) even though the base clearly has them. Mirrors
+ *  SchematicPainter.relevantSubUnits's identical fix for the same class of
+ *  symbol (there for rendering; here for connectivity) — resolved one level
+ *  by name within the SAME lib_symbols block the placed instance's own
+ *  libId resolved against. */
+function relevantSubUnits(libDef: KicadElementSymbol, placedUnit: number, libSymbols?: { findSymbolByName(name: string): KicadElementSymbol | undefined } | null): KicadElementSymbol[] {
+	let graphicsSource = libDef;
+	if (libDef.isDerived() && libDef.getLayers().length === 0) {
+		const base = libSymbols?.findSymbolByName(libDef.getExtends() ?? '');
+		if (base) {
+			graphicsSource = base;
+		}
+	}
+	const subUnits = graphicsSource.getLayers();
 	if (subUnits.length === 0) {
-		return [libDef];
+		return [graphicsSource];
 	}
 	return subUnits.filter(s => {
 		const { unit, deMorgan } = s.deconstructSymbolName();
