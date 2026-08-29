@@ -1,20 +1,23 @@
-import { KicadParser } from '@kicad-io/KicadParser';
-import { KicadElement } from '@kicad-io/KicadElement';
-import { KicadElementLibSymbols } from '@kicad-io/KicadElementLibSymbols';
-import { KicadElementSymbol } from '@kicad-io/KicadElementSymbol';
-import { KicadElementPin, KicadPinElectricalType } from '@kicad-io/KicadElementPin';
-import { KicadElementWire } from '@kicad-io/KicadElementWire';
-import { KicadElementJunction } from '@kicad-io/KicadElementJunction';
-import { KicadElementNoConnect } from '@kicad-io/KicadElementNoConnect';
-import { KicadElementGlobalLabel } from '@kicad-io/KicadElementGlobalLabel';
-import { KicadElementHierarchicalLabel } from '@kicad-io/KicadElementHierarchicalLabel';
-import { KicadElementSheet } from '@kicad-io/KicadElementSheet';
-import { KicadElementAt } from '@kicad-io/KicadElementAt';
+import { parseSchematic } from '@kicad-model/src/schematic/sch_io';
+import type { Schematic } from '@kicad-model/src/schematic/Schematic';
+import { SchematicSymbol } from '@kicad-model/src/schematic/SchematicSymbol';
+import { SchPin } from '@kicad-model/src/schematic/SchPin';
+import { SchWire } from '@kicad-model/src/schematic/SchWire';
+import { SchJunction } from '@kicad-model/src/schematic/SchJunction';
+import { SchNoConnect } from '@kicad-model/src/schematic/SchNoConnect';
+import { SchGlobalLabel, SchHierLabel, SchLabel } from '@kicad-model/src/schematic/SchLabel';
+import { SchematicSheet } from '@kicad-model/src/schematic/SchematicSheet';
+import { SchematicSheetPin } from '@kicad-model/src/schematic/SchematicSheetPin';
+import { SchematicSheetPath } from '@kicad-model/src/schematic/SheetPath';
+import { buildSheetConnectionGraph } from '@kicad-model/src/schematic/ConnectionGraph';
+import { busAliasResolverFor } from '@kicad-model/src/schematic/HierarchicalConnectionGraph';
+import type { GraphItem } from '@kicad-model/src/schematic/ConnectionGraphBuilder';
+import type { ConnectionSubgraph } from '@kicad-model/src/schematic/ConnectionSubgraph';
 
 export interface ConnectivityPinSummary {
 	number: string;
 	name: string;
-	type: KicadPinElectricalType;
+	type: string;
 	/** Set after net assignment — e.g. `"U1.3"` or `"IMU/U1.3"`. */
 	net?: string;
 }
@@ -82,18 +85,6 @@ export interface LoadedSchematicNode {
 	children: LoadedSchematicNode[];
 }
 
-type Pt = { x: number; y: number };
-
-type NodeTag =
-	| { kind: 'pin'; ref: string; number: string; name: string; type: KicadPinElectricalType; isPowerSymbol: boolean; isPwrFlag?: boolean; powerNetName?: string }
-	| { kind: 'global'; name: string }
-	| { kind: 'local'; name: string }
-	| { kind: 'hier'; name: string }
-	| { kind: 'sheet_pin'; name: string }
-	| { kind: 'nc' }
-	| { kind: 'junction' }
-	| { kind: 'wire' };
-
 interface SheetIsland {
 	id: string;
 	nameHint: string;
@@ -106,6 +97,8 @@ interface SheetIsland {
 	globalNames: string[];
 	hierNames: string[];
 	localNames: string[];
+	/** Sheet-box pin names touching this island (parent side). */
+	sheetPinNames: string[];
 	/** Mergeable power net names only (never "PWR_FLAG"). */
 	powerNames: string[];
 	/** True when a PWR_FLAG marker sits on this island (ERC only; not a merge key). */
@@ -127,8 +120,6 @@ interface SheetExtract {
 	childSheetNames: string[];
 }
 
-const SNAP_MM = 0.05;
-
 export class SchematicConnectivityService {
 	/**
 	 * Parse a single `.kicad_sch` string into components + nets.
@@ -144,8 +135,8 @@ export class SchematicConnectivityService {
 			throw new SchematicConnectivityError('Input does not look like a KiCad schematic (.kicad_sch)', 400);
 		}
 
-		const root = new KicadParser().parse(text);
-		const extract = this.extractSheet(root, {
+		const model = parseSchematic(text);
+		const extract = this.extractSheet(model, {
 			hierarchyPath: '',
 			sheetName: 'root',
 			file: '(paste)'
@@ -172,9 +163,9 @@ export class SchematicConnectivityService {
 					400
 				);
 			}
-			const root = new KicadParser().parse(text);
+			const model = parseSchematic(text);
 			const file = basenameOf(node.absolutePath) || node.sheetName;
-			extracts.push(this.extractSheet(root, {
+			extracts.push(this.extractSheet(model, {
 				hierarchyPath: node.hierarchyPath,
 				sheetName: node.sheetName,
 				file
@@ -217,145 +208,48 @@ export class SchematicConnectivityService {
 	}
 
 	protected extractSheet(
-		root: KicadElement,
+		model: Schematic,
 		opts: { hierarchyPath: string; sheetName: string; file: string }
 	): SheetExtract {
-		const libSymbols = root.findFirstChildByClass(KicadElementLibSymbols);
-		const placed = root.findChildrenByClass(KicadElementSymbol);
-		const wires = root.findChildrenByClass(KicadElementWire);
-		const junctions = root.findChildrenByClass(KicadElementJunction);
-		const noConnects = root.findChildrenByClass(KicadElementNoConnect);
-		const globals = root.findChildrenByClass(KicadElementGlobalLabel);
-		const hiers = root.findChildrenByClass(KicadElementHierarchicalLabel);
-		const locals = root.findChildrenByName('label');
-		const sheets = root.findChildrenByClass(KicadElementSheet);
-
-		const uf = new UnionFind();
-		const tagsByNode = new Map<number, NodeTag[]>();
-		/** Wire segment endpoints in world space — used to attach mid-wire pins/labels. */
-		const wireSegments: Array<{ ax: number; ay: number; bx: number; by: number; aId: number; bId: number }> = [];
-
-		const tagNode = (node: number, tag: NodeTag) => {
-			const list = tagsByNode.get(node) ?? [];
-			list.push(tag);
-			tagsByNode.set(node, list);
-		};
-
-		const ensurePoint = (p: Pt): number => {
-			const key = snapKey(p.x, p.y);
-			return uf.add(key);
-		};
-
-		/** Attach a schematic point to any wire segment it lies on (KiCad mid-wire labels/pins). */
-		const attachToWires = (p: Pt, nodeId: number) => {
-			for (const seg of wireSegments) {
-				if (pointOnSegment(p.x, p.y, seg.ax, seg.ay, seg.bx, seg.by, SNAP_MM)) {
-					uf.union(nodeId, seg.aId);
-					uf.union(nodeId, seg.bId);
-				}
-			}
-		};
-
-		for (const wire of wires) {
-			const pts = wire.getPoints();
-			if (pts.length < 2) {
-				continue;
-			}
-			let prev = ensurePoint(pts[0]!);
-			tagNode(prev, { kind: 'wire' });
-			for (let i = 1; i < pts.length; i++) {
-				const pt = pts[i]!;
-				const next = ensurePoint(pt);
-				tagNode(next, { kind: 'wire' });
-				uf.union(prev, next);
-				const prevPt = pts[i - 1]!;
-				wireSegments.push({
-					ax: prevPt.x, ay: prevPt.y,
-					bx: pt.x, by: pt.y,
-					aId: prev, bId: next
-				});
-				prev = next;
-			}
-		}
-
-		for (const j of junctions) {
-			const o = j.getOrigin();
-			const p = { x: o.x, y: o.y };
-			const n = ensurePoint(p);
-			attachToWires(p, n);
-			tagNode(n, { kind: 'junction' });
-		}
-
-		for (const nc of noConnects) {
-			const o = nc.getOrigin();
-			const p = { x: o.x, y: o.y };
-			const n = ensurePoint(p);
-			attachToWires(p, n);
-			tagNode(n, { kind: 'nc' });
-		}
-
-		for (const g of globals) {
-			const o = g.getOrigin();
-			const p = { x: o.x, y: o.y };
-			const n = ensurePoint(p);
-			attachToWires(p, n);
-			tagNode(n, { kind: 'global', name: g.getName() });
-		}
-
-		for (const h of hiers) {
-			const o = h.getOrigin();
-			const p = { x: o.x, y: o.y };
-			const n = ensurePoint(p);
-			attachToWires(p, n);
-			tagNode(n, { kind: 'hier', name: h.getName() });
-		}
-
-		for (const label of locals) {
-			const name = String(label.attributes?.[0]?.value ?? '').trim();
-			if (!name) {
-				continue;
-			}
-			const at = label.findFirstChildByClass(KicadElementAt);
-			if (!at) {
-				continue;
-			}
-			const p = { x: at.x, y: at.y };
-			const n = ensurePoint(p);
-			attachToWires(p, n);
-			tagNode(n, { kind: 'local', name });
-		}
+		const screen = model.allScreens()[0];
+		const items = screen?.items ?? [];
+		const placed = items.filter((i): i is SchematicSymbol => i instanceof SchematicSymbol);
+		const wires = items.filter((i): i is SchWire => i instanceof SchWire);
+		const junctions = items.filter((i): i is SchJunction => i instanceof SchJunction);
+		const noConnects = items.filter((i): i is SchNoConnect => i instanceof SchNoConnect);
+		const globals = items.filter((i): i is SchGlobalLabel => i instanceof SchGlobalLabel);
+		const hiers = items.filter((i): i is SchHierLabel => i instanceof SchHierLabel);
+		const locals = items.filter((i): i is SchLabel => i instanceof SchLabel);
+		const sheets = items.filter((i): i is SchematicSheet => i instanceof SchematicSheet);
 
 		let sheetPinCount = 0;
 		const childSheetNames: string[] = [];
+		const sheetPinItems: SchematicSheetPin[] = [];
 		for (const sheet of sheets) {
-			const props = sheet.getAllProperties?.() ?? {};
-			const sheetName = String(props['Sheetname'] ?? '').trim();
+			const sheetName = sheet.getName().trim();
 			if (sheetName) {
 				childSheetNames.push(sheetName);
 			}
-			// Sheet pins reuse KicadElementPin with name in attributes[0], shape in [1].
-			for (const pin of sheet.findChildrenByClass(KicadElementPin)) {
-				const pinName = String(pin.attributes?.[0]?.value ?? '').trim();
-				if (!pinName) {
+			for (const pin of sheet.pins) {
+				if (!pin.getText().trim()) {
 					continue;
 				}
 				sheetPinCount++;
-				const o = pin.getOrigin();
-				const p = { x: o.x, y: o.y };
-				const n = ensurePoint(p);
-				attachToWires(p, n);
-				tagNode(n, { kind: 'sheet_pin', name: pinName });
+				sheetPinItems.push(pin);
 			}
 		}
 
 		const components: ConnectivityComponent[] = [];
 		const refPrefix = opts.hierarchyPath ? `${ opts.hierarchyPath }/` : '';
+		/** Per-item pin metadata, since the real connectivity engine's items
+		 *  are the actual placed `SchPin` objects, not geometric tags. */
+		const pinMeta = new Map<SchPin, { ref: string; number: string; name: string; type: string; isPowerSymbol: boolean; isPwrFlag: boolean; powerNetName?: string }>();
+		const graphPins: SchPin[] = [];
 
 		for (const instance of placed) {
 			const libId = instance.getLibId() ?? '';
-			const props = instance.getAllProperties();
-			const rawRef = props['Reference'] ?? instance.getReference() ?? '';
-			const value = props['Value'] ?? '';
+			const rawRef = instance.getReference() ?? '';
+			const value = instance.getProperties().find(f => f.getName() === 'Value')?.getText() ?? '';
 			if (!rawRef) {
 				continue;
 			}
@@ -367,58 +261,62 @@ export class SchematicConnectivityService {
 				|| libId.startsWith('power:');
 			// Power / flag refs stay unprefixed (global by nature); real parts get path prefix.
 			const ref = isPower || !refPrefix ? rawRef : `${ refPrefix }${ rawRef }`;
-			const origin = instance.getOrigin();
-			const mirror = readMirror(instance);
 			const placedUnit = instance.getUnitId() || 1;
-			// (lib_name "X") overrides the lib_symbols lookup key when
-			// present — see SchematicPainter.buildSymbolInstance's identical
-			// fix for why. Without this, a symbol like this (real files:
-			// commonly power:GND placed multiple times, each getting its own
-			// "GND_1"/"GND_2" cached copy) resolves no pins at all here,
-			// silently dropping it from the connectivity graph entirely.
-			const libLookupName = instance.getLibName?.() ?? libId;
-			const libDef = libSymbols?.findSymbolByName(libLookupName) ?? null;
 			const pinSummaries: ConnectivityPinSummary[] = [];
 
-			if (libDef) {
-				for (const sub of relevantSubUnits(libDef, placedUnit, libSymbols)) {
-					for (const pin of sub.findChildrenByClass(KicadElementPin)) {
-						// Invisible POWER pins (e.g. the pin inside a power:GND / +3.3V
-						// symbol) are still electrically connected in KiCad — skipping
-						// them fragments ground/rail nets and loses the "GND" name.
-						// Regular component hidden pins keep the original skip.
-						if (pin.isHidden() && !isPower) {
-							continue;
-						}
-						const { name, number } = pin.getPin();
-						const { electricalType } = pin.getType();
-						const pinOrigin = pin.getOrigin();
-						const world = flippedTransform(
-							origin.x,
-							origin.y,
-							origin.rotation ?? 0,
-							mirror,
-							pinOrigin.x,
-							pinOrigin.y
-						);
-						const node = ensurePoint(world);
-						attachToWires(world, node);
-						// PWR_FLAG attaches to whichever net it sits on for ERC — it must
-						// NOT contribute a mergeable power net name (Value is always
-						// "PWR_FLAG", which would short every flagged net together).
-						tagNode(node, {
-							kind: 'pin',
-							ref,
-							number,
-							name,
-							type: electricalType,
-							isPowerSymbol: isPower,
-							isPwrFlag: isPwrFlag || undefined,
-							powerNetName: isPower && !isPwrFlag ? value : undefined
-						});
-						pinSummaries.push({ number, name, type: electricalType });
-					}
+			// A derived symbol (`derivedFrom`, e.g. AMS1117-3.3 extending a
+			// shared AMS1117 base) has no pins of its own in the library —
+			// `instance.pins` (`SchematicSymbol.updatePins()`) is therefore
+			// empty too, since it only ever copies `instance.libSymbol.pins`
+			// with no derivedFrom fallback. Synthesize instance-owned pin
+			// copies from the resolved base here (parented to `instance`, not
+			// the base LibSymbol, so `ConnectionGraphBuilder`'s
+			// `pinWorldPosition()` transforms them by this placement).
+			let instancePins = instance.pins;
+			if (instancePins.length === 0 && instance.libSymbol?.isDerived() && instance.libSymbol.derivedFrom) {
+				const base = model.getLibSymbol(instance.libSymbol.derivedFrom);
+				instancePins = (base?.pins ?? []).map(libPin => {
+					const p = new SchPin(instance, libPin.uuid);
+					p.name = libPin.name;
+					p.number = libPin.number;
+					p.electricalType = libPin.electricalType;
+					p.hidden = libPin.hidden;
+					p.unit = libPin.unit;
+					p.setPosition(libPin.getPos());
+					return p;
+				});
+			}
+
+			// Placed, per-instance pins — the same objects the real
+			// connectivity engine's adjacency graph matches by world point
+			// (`ConnectionGraphBuilder`'s `pinWorldPosition()` transforms
+			// them by this instance's own placement, so no manual transform
+			// is needed here the way the old geometric snap required).
+			for (const pin of instancePins) {
+				if (pin.unit !== 0 && pin.unit !== placedUnit) {
+					continue;
 				}
+				// Invisible POWER pins (e.g. the pin inside a power:GND / +3.3V
+				// symbol) are still electrically connected in KiCad — skipping
+				// them fragments ground/rail nets and loses the "GND" name.
+				// Regular component hidden pins keep the original skip.
+				if (pin.isHidden() && !isPower) {
+					continue;
+				}
+				const name = pin.name;
+				const number = pin.number;
+				const electricalType = pin.getTypeString();
+				graphPins.push(pin);
+				// PWR_FLAG attaches to whichever net it sits on for ERC — it must
+				// NOT contribute a mergeable power net name (Value is always
+				// "PWR_FLAG", which would short every flagged net together).
+				pinMeta.set(pin, {
+					ref, number, name, type: electricalType,
+					isPowerSymbol: isPower,
+					isPwrFlag,
+					powerNetName: isPower && !isPwrFlag ? value : undefined
+				});
+				pinSummaries.push({ number, name, type: electricalType });
 			}
 
 			components.push({
@@ -432,119 +330,34 @@ export class SchematicConnectivityService {
 			});
 		}
 
-		const membersByRoot = new Map<number, number[]>();
-		for (const id of uf.allIds()) {
-			const rootId = uf.find(id);
-			const list = membersByRoot.get(rootId) ?? [];
-			list.push(id);
-			membersByRoot.set(rootId, list);
-		}
+		// Real KiCad-priority connectivity: exact-point adjacency graph +
+		// flood-fill into subgraphs (`ConnectionGraphBuilder`), then
+		// real driver-priority resolution + same-name merge
+		// (`ConnectionGraph`'s `buildSheetConnectionGraph`) — replaces the
+		// ±0.05mm geometric-snap union-find this method used to run.
+		const graphItems: GraphItem[] = [
+			...wires, ...junctions, ...noConnects, ...globals, ...hiers, ...locals, ...sheetPinItems, ...graphPins
+		];
+		const sheetPath = new SchematicSheetPath();
+		const { subgraphs } = buildSheetConnectionGraph(graphItems, sheetPath, busAliasResolverFor(model));
 
 		const islands: SheetIsland[] = [];
 		const hierLabelToIsland = new Map<string, string>();
 		const sheetPinToIsland = new Map<string, string>();
-		let anonCounter = 1;
 		let islandSeq = 0;
 
-		for (const [, memberIds] of membersByRoot) {
-			const tags: NodeTag[] = [];
-			for (const id of memberIds) {
-				const t = tagsByNode.get(id);
-				if (t) {
-					tags.push(...t);
-				}
-			}
-
-			const pinTags = tags.filter((t): t is Extract<NodeTag, { kind: 'pin' }> => t.kind === 'pin');
-			const globalNames = tags.filter((t): t is Extract<NodeTag, { kind: 'global' }> => t.kind === 'global').map(t => t.name);
-			const localNames = tags.filter((t): t is Extract<NodeTag, { kind: 'local' }> => t.kind === 'local').map(t => t.name);
-			const hierNames = tags.filter((t): t is Extract<NodeTag, { kind: 'hier' }> => t.kind === 'hier').map(t => t.name);
-			const sheetPinNames = tags.filter((t): t is Extract<NodeTag, { kind: 'sheet_pin' }> => t.kind === 'sheet_pin').map(t => t.name);
-			const powerNames = pinTags
-				.filter(t => t.isPowerSymbol && t.powerNetName && !isPwrFlagNetName(t.powerNetName))
-				.map(t => t.powerNetName!);
-			const hasPwrFlag = pinTags.some(t => t.isPwrFlag === true);
-			const hasNc = tags.some(t => t.kind === 'nc');
-
-			if (pinTags.length === 0 && globalNames.length === 0 && localNames.length === 0
-				&& hierNames.length === 0 && powerNames.length === 0 && sheetPinNames.length === 0) {
-				continue;
-			}
-
-			let nameHint = '';
-			let isPower = false;
-			if (globalNames.length > 0) {
-				nameHint = globalNames[0]!;
-			}
-			else if (powerNames.length > 0) {
-				nameHint = powerNames[0]!;
-				isPower = true;
-			}
-			else if (hierNames.length > 0) {
-				nameHint = hierNames[0]!;
-			}
-			else if (sheetPinNames.length > 0) {
-				nameHint = sheetPinNames[0]!;
-			}
-			else if (localNames.length > 0) {
-				nameHint = localNames[0]!;
-			}
-			else if (pinTags.length > 0) {
-				const p = pinTags[0]!;
-				nameHint = `Net-(${ p.ref }-Pad${ p.number })`;
-			}
-			else {
-				nameHint = `Net-anon-${ anonCounter++ }`;
-			}
-
-			if (powerNames.length > 0 || looksLikePowerNetName(nameHint)) {
-				isPower = true;
-			}
-			if (hasPwrFlag) {
-				isPower = true;
-			}
-
-			const islandId = `${ opts.hierarchyPath || '/' }#${ islandSeq++ }`;
-			// Report only real-part pins on nets; power/flag pins still participate in
-			// geometry + power-name merge via tags, but omit #PWR/#FLG clutter from pin lists.
-			const pinKeys = [...new Set(
-				pinTags
-					.filter(t => !t.isPowerSymbol)
-					.map(t => `${ t.ref }.${ t.number }`)
-			)];
-			const powerPinKeys = [...new Set(
-				pinTags
-					.filter(t => t.isPowerSymbol)
-					.map(t => `${ t.ref }.${ t.number }`)
-			)];
-			const labelNames = [...new Set([
-				...globalNames, ...localNames, ...hierNames, ...powerNames, ...sheetPinNames
-			])];
-
-			const island: SheetIsland = {
-				id: islandId,
-				nameHint,
-				isPower,
-				pinKeys,
-				powerPinKeys,
-				labelNames,
-				globalNames: [...new Set(globalNames)],
-				hierNames: [...new Set(hierNames)],
-				localNames: [...new Set(localNames)],
-				powerNames: [...new Set(powerNames)],
-				hasPwrFlag,
-				hasNc
-			};
+		for (const subgraph of subgraphs) {
+			const island = islandFromSubgraph(subgraph, pinMeta, `${ opts.hierarchyPath || '/' }#${ islandSeq++ }`);
 			islands.push(island);
 
 			for (const hn of island.hierNames) {
 				if (!hierLabelToIsland.has(hn)) {
-					hierLabelToIsland.set(hn, islandId);
+					hierLabelToIsland.set(hn, island.id);
 				}
 			}
-			for (const sp of [...new Set(sheetPinNames)]) {
+			for (const sp of island.sheetPinNames) {
 				if (!sheetPinToIsland.has(sp)) {
-					sheetPinToIsland.set(sp, islandId);
+					sheetPinToIsland.set(sp, island.id);
 				}
 			}
 		}
@@ -822,6 +635,102 @@ export class SchematicConnectivityService {
 	}
 }
 
+/** Aggregate one `ConnectionSubgraph`'s items into the geometric-era
+ *  `SheetIsland` shape `finalizeFromExtracts()` already knows how to merge
+ *  (by label name) and report on — the adapter between the real
+ *  driver-priority connectivity engine and this file's existing
+ *  cross-sheet/global merge + heuristics pipeline. */
+function islandFromSubgraph(
+	subgraph: ConnectionSubgraph,
+	pinMeta: Map<SchPin, { ref: string; number: string; name: string; type: string; isPowerSymbol: boolean; isPwrFlag: boolean; powerNetName?: string }>,
+	islandId: string
+): SheetIsland {
+	const globalNames: string[] = [];
+	const hierNames: string[] = [];
+	const localNames: string[] = [];
+	const sheetPinNames: string[] = [];
+	const powerNames: string[] = [];
+	const pinKeys: string[] = [];
+	const powerPinKeys: string[] = [];
+	let hasPwrFlag = false;
+
+	for (const item of subgraph.items) {
+		if (item instanceof SchPin) {
+			const meta = pinMeta.get(item);
+			if (!meta) {
+				continue;
+			}
+			const key = `${ meta.ref }.${ meta.number }`;
+			if (meta.isPowerSymbol) {
+				powerPinKeys.push(key);
+				if (meta.powerNetName && !isPwrFlagNetName(meta.powerNetName)) {
+					powerNames.push(meta.powerNetName);
+				}
+			}
+			else {
+				pinKeys.push(key);
+			}
+			if (meta.isPwrFlag) {
+				hasPwrFlag = true;
+			}
+		}
+		else if (item instanceof SchGlobalLabel) {
+			globalNames.push(item.getName());
+		}
+		else if (item instanceof SchHierLabel) {
+			hierNames.push(item.getName());
+		}
+		else if (item instanceof SchLabel) {
+			const n = item.getName().trim();
+			if (n) {
+				localNames.push(n);
+			}
+		}
+		else if (item instanceof SchematicSheetPin) {
+			const n = item.getText().trim();
+			if (n) {
+				sheetPinNames.push(n);
+			}
+		}
+	}
+
+	// `getNetName()` is the real KiCad-priority-resolved name (pin < sheet-pin
+	// < hier-label < local-label < power-pin < global — see
+	// `ConnectionSubgraph.resolveDrivers()`), a strictly more correct
+	// ordering than this file's old geometric-era name-hint priority list.
+	let nameHint = subgraph.getNetName();
+	if (!nameHint) {
+		const firstKey = pinKeys[0] ?? powerPinKeys[0];
+		nameHint = firstKey ? `Net-(${ firstKey })` : 'Net-anon';
+	}
+
+	let isPower = powerNames.length > 0;
+	if (looksLikePowerNetName(nameHint)) {
+		isPower = true;
+	}
+	if (hasPwrFlag) {
+		isPower = true;
+	}
+
+	const uniq = (arr: string[]) => [...new Set(arr)];
+
+	return {
+		id: islandId,
+		nameHint,
+		isPower,
+		pinKeys: uniq(pinKeys),
+		powerPinKeys: uniq(powerPinKeys),
+		labelNames: uniq([...globalNames, ...localNames, ...hierNames, ...powerNames, ...sheetPinNames]),
+		globalNames: uniq(globalNames),
+		hierNames: uniq(hierNames),
+		localNames: uniq(localNames),
+		sheetPinNames: uniq(sheetPinNames),
+		powerNames: uniq(powerNames),
+		hasPwrFlag,
+		hasNc: subgraph.noConnect !== null
+	};
+}
+
 export class SchematicConnectivityError extends Error {
 	constructor(message: string, readonly statusCode: 400 | 502 = 400) {
 		super(message);
@@ -832,36 +741,6 @@ export class SchematicConnectivityError extends Error {
 function basenameOf(filePath: string): string {
 	const idx = Math.max(filePath.lastIndexOf('/'), filePath.lastIndexOf('\\'));
 	return idx >= 0 ? filePath.slice(idx + 1) : filePath;
-}
-
-function snapKey(x: number, y: number): string {
-	return `${ Math.round(x / SNAP_MM) },${ Math.round(y / SNAP_MM) }`;
-}
-
-/** True if (px,py) lies on segment AB within tol (axis-aligned or diagonal). */
-function pointOnSegment(
-	px: number, py: number,
-	ax: number, ay: number,
-	bx: number, by: number,
-	tol: number
-): boolean {
-	const minX = Math.min(ax, bx) - tol;
-	const maxX = Math.max(ax, bx) + tol;
-	const minY = Math.min(ay, by) - tol;
-	const maxY = Math.max(ay, by) + tol;
-	if (px < minX || px > maxX || py < minY || py > maxY) {
-		return false;
-	}
-	const dx = bx - ax;
-	const dy = by - ay;
-	const lenSq = dx * dx + dy * dy;
-	if (lenSq < 1e-12) {
-		return Math.hypot(px - ax, py - ay) <= tol;
-	}
-	const t = Math.max(0, Math.min(1, ((px - ax) * dx + (py - ay) * dy) / lenSq));
-	const cx = ax + t * dx;
-	const cy = ay + t * dy;
-	return Math.hypot(px - cx, py - cy) <= tol;
 }
 
 function looksLikePowerNetName(name: string): boolean {
@@ -882,72 +761,6 @@ function isPwrFlagSymbol(libId: string, value: string, rawRef: string): boolean 
 	}
 	const id = libId.trim();
 	return id === 'power:PWR_FLAG' || id.endsWith(':PWR_FLAG');
-}
-
-/** Was its own hand-rolled attribute/children scan — went stale when
- *  KicadElementMirror got properly registered (KicadElementLiteral's
- *  afterParse() consumes `(mirror y)`'s bareword attribute into `.value`
- *  and clears `.attributes`, so this always returned null afterward,
- *  silently dropping every mirrored symbol's pins out of the connectivity
- *  graph — see [[kicad-viewer-mirror-rotation-order]] for the render-side
- *  history of this exact class of bug). Delegates to
- *  KicadElementSymbol.getMirror(), the one already kept correct for
- *  rendering, instead of maintaining a second implementation. */
-function readMirror(instance: KicadElementSymbol): 'x' | 'y' | null {
-	return instance.getMirror();
-}
-
-/** A derived symbol (`(extends "Base")`, e.g. AMS1117-3.3 extending a
- *  shared AMS1117 base) has no sub-unit children of its own — all pins live
- *  only on the base. Without resolving that chain, the old
- *  `subUnits.length === 0` fallback (`return [libDef]`) returned a symbol
- *  with NO pins at all, so every one of its pads failed net matching (`no
- *  pin N in symbol`) even though the base clearly has them. Mirrors
- *  SchematicPainter.relevantSubUnits's identical fix for the same class of
- *  symbol (there for rendering; here for connectivity) — resolved one level
- *  by name within the SAME lib_symbols block the placed instance's own
- *  libId resolved against. */
-function relevantSubUnits(libDef: KicadElementSymbol, placedUnit: number, libSymbols?: { findSymbolByName(name: string): KicadElementSymbol | undefined } | null): KicadElementSymbol[] {
-	let graphicsSource = libDef;
-	if (libDef.isDerived() && libDef.getLayers().length === 0) {
-		const base = libSymbols?.findSymbolByName(libDef.getExtends() ?? '');
-		if (base) {
-			graphicsSource = base;
-		}
-	}
-	const subUnits = graphicsSource.getLayers();
-	if (subUnits.length === 0) {
-		return [graphicsSource];
-	}
-	return subUnits.filter(s => {
-		const { unit, deMorgan } = s.deconstructSymbolName();
-		return (unit === 0 || unit === placedUnit) && (deMorgan === 0 || deMorgan === 1);
-	});
-}
-
-/** Library-local → schematic world (Y-flip + mirror + rotate + translate). Matches SchematicPainter. */
-function flippedTransform(
-	instX: number,
-	instY: number,
-	rotationDeg: number,
-	mirror: 'x' | 'y' | null,
-	localX: number,
-	localY: number
-): Pt {
-	let x = localX;
-	let y = -localY;
-	if (mirror === 'x') {
-		y = -y;
-	}
-	else if (mirror === 'y') {
-		x = -x;
-	}
-	const rad = (rotationDeg * Math.PI) / 180;
-	const c = Math.cos(rad);
-	const s = Math.sin(rad);
-	const rx = x * c - y * s;
-	const ry = x * s + y * c;
-	return { x: rx + instX, y: ry + instY };
 }
 
 function buildHeuristics(
@@ -1056,49 +869,6 @@ function buildHeuristics(
 	}
 
 	return out;
-}
-
-class UnionFind {
-	private parent = new Map<number, number>();
-	private keyToId = new Map<string, number>();
-	private nextId = 1;
-
-	add(key: string): number {
-		const existing = this.keyToId.get(key);
-		if (existing !== undefined) {
-			return existing;
-		}
-		const id = this.nextId++;
-		this.keyToId.set(key, id);
-		this.parent.set(id, id);
-		return id;
-	}
-
-	find(id: number): number {
-		let root = id;
-		while (this.parent.get(root) !== root) {
-			root = this.parent.get(root)!;
-		}
-		let cur = id;
-		while (cur !== root) {
-			const next = this.parent.get(cur)!;
-			this.parent.set(cur, root);
-			cur = next;
-		}
-		return root;
-	}
-
-	union(a: number, b: number): void {
-		const ra = this.find(a);
-		const rb = this.find(b);
-		if (ra !== rb) {
-			this.parent.set(rb, ra);
-		}
-	}
-
-	allIds(): number[] {
-		return [...this.parent.keys()];
-	}
 }
 
 class UnionFindString {

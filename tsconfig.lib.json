@@ -10,7 +10,8 @@
 		"noEmit": true,
 		"baseUrl": ".",
 		"paths": {
-			"@kicad-io/*": ["../kicad-io/src/*"]
+			"@kicad-io/*": ["../kicad-io/src/*"],
+			"@kicad-model/*": ["../kicad-model/*"]
 		}
 	},
 	"include": ["./**/*.ts"]

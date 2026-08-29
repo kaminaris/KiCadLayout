@@ -5,7 +5,6 @@
 
 export * from './Types';
 export * from './Geometry';
-export * from './Router';
 export * from './Score';
 export {
 	seedFromInputs,
